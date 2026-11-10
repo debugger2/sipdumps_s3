@@ -1,0 +1,10 @@
+# capture data and derived artifacts (contain phone numbers / IPs, too big for git)
+*.pcap
+*.pcapng
+*.wav
+*.mp3
+analysis/audio/
+analysis/sip_index.json
+analysis/new_tmp/
+tools/
+__pycache__/
