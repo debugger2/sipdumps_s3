@@ -317,21 +317,33 @@ def parse_sip(ts, host, src, dst, sport, dport, payload):
 
 
 def index_file(path, host):
-    msgs, ra = [], Reassembler()
+    msgs, ra, partial = [], Reassembler(), {}
     for ts, lt, data in pcap_iter(path):
         p = decode(ts, lt, data)
         if p is None or p.proto not in (6, 17):
             continue
+        fkey = (p.src, p.dst, p.ident)
         if p.mf or p.frag_off:
             r = ra.add(p)
             if not r:
+                if p.frag_off == 0:
+                    # first fragment alone already holds the SIP headers; the rest is often not
+                    # captured (tcpdump "udp port" filter), so index it now and upgrade if it completes
+                    m = parse_sip(ts, host, ip_s(p.src), ip_s(p.dst), p.sport, p.dport, p.payload)
+                    if m:
+                        partial[fkey] = len(msgs)
+                        msgs.append(m)
                 continue
             sport, dport, payload = r
         else:
             sport, dport, payload = p.sport, p.dport, p.payload
         m = parse_sip(ts, host, ip_s(p.src), ip_s(p.dst), sport, dport, payload)
         if m:
-            msgs.append(m)
+            if fkey in partial and (p.mf or p.frag_off):
+                m.ts = msgs[partial[fkey]].ts
+                msgs[partial.pop(fkey)] = m
+            else:
+                msgs.append(m)
     return msgs
 
 
@@ -596,6 +608,7 @@ def main():
     # extend the window until each matched call has its INVITE and its end
     lo, hi = t_from, t_to
     lim_lo, lim_hi = t_from - a.max_extend * 60, t_to + a.max_extend * 60
+    can_lo = can_hi = True
     while True:
         # only calls that overlap the requested window; extension just completes them
         seeds = [d.cid for d in sorted(ds.values(), key=lambda d: d.t0)
@@ -603,16 +616,27 @@ def main():
         if not seeds:
             raise SystemExit("no matching call in %s .. %s" % (fmt_ts(t_from), fmt_ts(t_to)))
         groups = group_dialogs(ds, seeds)
-        need_lo = any(ds[c].is_call() and not ds[c].invite() for g in groups for c in g)
-        need_hi = any(ds[c].pending() for g in groups for c in g)
+        if a.call_id or a.icc_uuid:
+            # legs named explicitly belong to one call -> one pcap
+            groups = [sorted(set(c for g in groups for c in g), key=lambda c: ds[c].t0)]
+        cids = set(c for g in groups for c in g)
+        need_lo = can_lo and any(ds[c].is_call() and not ds[c].invite() for c in cids)
+        need_hi = can_hi and any(ds[c].pending() for c in cids)
         nlo = max(lim_lo, lo - EXTEND_STEP) if need_lo and lo > lim_lo else lo
         nhi = min(lim_hi, hi + EXTEND_STEP) if need_hi and hi < lim_hi else hi
         if (nlo, nhi) == (lo, hi):
             break
         print("call not complete, extending window to %s .. %s" % (fmt_ts(nlo), fmt_ts(nhi)), file=sys.stderr)
+        before = {c: set(m.ts for m in ds[c].msgs) for c in cids}
+        t_min, t_max = min(ds[c].t0 for c in cids), max(ds[c].t1 for c in cids)
         lo, hi = nlo, nhi
         load(lo, hi)
         ds = current()
+        # a step that brought nothing new for these legs (e.g. INVITE sent over TLS/WS, never
+        # captured) stops growing the window in that direction
+        new = [m.ts for c in cids for m in ds[c].msgs if m.ts not in before[c]]
+        can_lo = can_lo and any(t < t_min for t in new)
+        can_hi = can_hi and any(t > t_max for t in new)
 
     os.makedirs(a.out_dir, exist_ok=True)
     for g in groups:
